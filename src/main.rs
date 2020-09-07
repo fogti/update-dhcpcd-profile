@@ -9,28 +9,25 @@ fn get_dump(iface: &str) -> Result<HashMap<String, String>, String> {
         .output()
         .expect("failed to spawn 'dhcpcd -U'");
 
-    let mut vars = HashMap::new();
-
-    for i in std::str::from_utf8(&dhdump.stdout)
+    let mut vars: HashMap<_, _> = std::str::from_utf8(&dhdump.stdout)
         .expect("got non-utf8 result")
         .lines()
-    {
-        let (var, value) = match i.find(|x| x == '=') {
-            Some(pos) => (&i[..pos], &i[pos + 1..]),
-            None => continue,
-        };
-        if value.is_empty() {
-            continue;
-        }
-        let value = if value.bytes().nth(0).unwrap() == b'\''
-            && value.bytes().rev().nth(0).unwrap() == b'\''
-        {
-            &value[1..value.len() - 1]
-        } else {
-            value
-        };
-        vars.insert(var.to_owned(), value.to_owned());
-    }
+        .flat_map(|i| i.find(|x| x == '=').map(|pos| (&i[..pos], &i[pos + 1..])))
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(key, value)| {
+            (
+                key.to_owned(),
+                if value.bytes().nth(0).unwrap() == b'\''
+                    && value.bytes().rev().nth(0).unwrap() == b'\''
+                {
+                    &value[1..value.len() - 1]
+                } else {
+                    value
+                }
+                .to_owned(),
+            )
+        })
+        .collect();
 
     if vars.is_empty() {
         return Err(std::str::from_utf8(&dhdump.stderr)
@@ -38,75 +35,40 @@ fn get_dump(iface: &str) -> Result<HashMap<String, String>, String> {
             .to_owned());
     }
 
-    let selected_vars: HashSet<&str> = vec![
+    let selected_vars: HashSet<&str> = [
         "broadcast_address",
         "domain_name_servers",
         "ip_address",
         "routers",
         "subnet_cidr",
     ]
-    .into_iter()
+    .iter()
+    .copied()
     .collect();
 
     vars.retain(|var, _| selected_vars.contains(&var[..]));
     Ok(vars)
 }
 
-struct ConfigData(Vec<String>);
+fn read_config_from_file(fpath: &str) -> Result<Vec<String>, anyhow::Error> {
+    Ok(
+        std::str::from_utf8(&*readfilez::read_from_file(std::fs::File::open(fpath))?)?
+            .lines()
+            .map(|i| i.to_owned())
+            .collect(),
+    )
+}
 
-impl ConfigData {
-    pub fn replace_profile(&mut self, profile: &str, vars: &HashMap<String, String>) {
-        let profile_stline = "profile ".to_owned() + profile;
-
-        // 1. remove profile
-        {
-            let mut is_in_this_profile = false;
-            self.0.retain(|line| {
-                if line.starts_with("profile ") {
-                    is_in_this_profile = line == &profile_stline;
-                }
-                !is_in_this_profile
-            });
-        }
-
-        // 2. add profile
-        {
-            self.0.reserve(2 + vars.len());
-            self.0.push(String::new());
-            self.0.push(profile_stline);
-            for (key, value) in vars {
-                let mut s = String::with_capacity(8 + key.len() + value.len());
-                s += "static ";
-                s += key;
-                s += "=";
-                s += value;
-                self.0.push(s);
-            }
-        }
-
-        self.0.shrink_to_fit();
+fn write_config_to_file(config: &[String], fpath: &str) -> Result<(), anyhow::Error> {
+    let fpath = std::path::Path::new(fpath);
+    let mut bufwro = BufWriter::new(tempfile::NamedTempFile::new_in(
+        fpath.parent().expect("got invalid output file path"),
+    )?);
+    for line in config.iter() {
+        writeln!(bufwro, "{}", line)?;
     }
-
-    pub fn read_from_file(fpath: &str) -> Result<ConfigData, anyhow::Error> {
-        let fh_in = readfilez::read_from_file(std::fs::File::open(fpath))?;
-        let mut ret = ConfigData(vec![]);
-        for i in std::str::from_utf8(fh_in.as_slice())?.lines() {
-            ret.0.push(i.to_owned());
-        }
-        Ok(ret)
-    }
-
-    pub fn write_to_file(&self, fpath: &str) -> Result<(), anyhow::Error> {
-        let fpath = std::path::Path::new(fpath);
-        let mut bufwro = BufWriter::new(tempfile::NamedTempFile::new_in(
-            fpath.parent().expect("got invalid output file path"),
-        )?);
-        for line in &self.0 {
-            writeln!(bufwro, "{}", line)?;
-        }
-        bufwro.into_inner()?.persist(fpath)?;
-        Ok(())
-    }
+    bufwro.into_inner()?.persist(fpath)?;
+    Ok(())
 }
 
 fn main() {
@@ -138,14 +100,31 @@ fn main() {
     let iface = matches.value_of("IFACE").unwrap();
     let profile = matches.value_of("PROFILE").unwrap();
     let outfpath = matches.value_of("output").unwrap_or("/etc/dhcpcd.conf");
-
     let vars = get_dump(iface).expect("got invalid dump");
+
     let mut config =
-        ConfigData::read_from_file("/etc/dhcpcd.conf").expect("unable to read /etc/dhcpcd.conf");
+        read_config_from_file("/etc/dhcpcd.conf").expect("unable to read /etc/dhcpcd.conf");
 
-    config.replace_profile(profile, &vars);
+    // 1. remove profile
+    {
+        let mut is_in_this_profile = false;
+        config.retain(|line| {
+            if let Some(x) = line.strip_prefix("profile ") {
+                is_in_this_profile = x == profile;
+            }
+            !is_in_this_profile
+        });
+    }
 
-    config
-        .write_to_file(outfpath)
-        .expect("unable to write output");
+    // 2. add profile
+    config.reserve(2 + vars.len());
+    config.push(String::new());
+    config.push("profile ".to_owned() + profile);
+    config.extend(
+        vars.iter()
+            .map(|(key, value)| format!("static {}={}", key, value)),
+    );
+    config.shrink_to_fit();
+
+    write_config_to_file(&config, outfpath).expect("unable to write output");
 }

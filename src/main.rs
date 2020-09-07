@@ -87,7 +87,7 @@ impl ConfigData {
         self.0.shrink_to_fit();
     }
 
-    pub fn read_from_file(fpath: &str) -> Result<ConfigData, failure::Error> {
+    pub fn read_from_file(fpath: &str) -> Result<ConfigData, anyhow::Error> {
         let fh_in = readfilez::read_from_file(std::fs::File::open(fpath))?;
         let mut ret = ConfigData(vec![]);
         for i in std::str::from_utf8(fh_in.as_slice())?.lines() {
@@ -96,7 +96,7 @@ impl ConfigData {
         Ok(ret)
     }
 
-    pub fn write_to_file(&self, fpath: &str) -> Result<(), failure::Error> {
+    pub fn write_to_file(&self, fpath: &str) -> Result<(), anyhow::Error> {
         let fpath = std::path::Path::new(fpath);
         let mut bufwro = BufWriter::new(tempfile::NamedTempFile::new_in(
             fpath.parent().expect("got invalid output file path"),
